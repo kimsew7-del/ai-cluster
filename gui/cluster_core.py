@@ -337,9 +337,9 @@ class TaskRunThread(QThread):
 
     async def _run_remote(self, worker: dict, task: str, timeout: int) -> dict:
         project_name = Path(self.project_dir).name if self.project_dir else ""
-        remote_cmd = f'~/ai {json.dumps(task)}'
+        remote_cmd = f'~/ai {json.dumps(task, ensure_ascii=False)}'
         if project_name:
-            remote_cmd = f'~/ai {json.dumps(task)} {json.dumps(project_name)}'
+            remote_cmd = f'~/ai {json.dumps(task, ensure_ascii=False)} {json.dumps(project_name, ensure_ascii=False)}'
         cmd = [
             "ssh", "-o", "ConnectTimeout=10",
             f'{worker["user"]}@{worker["host"]}',
