@@ -1,0 +1,23 @@
+integrations:
+  git:
+    repo_path: /home/sw/Github/Auto-Tracking-Drone
+orchestrator:
+  max_retries: 2
+  results_dir: ~/.claude-cluster/results
+  timeout: 300
+roles:
+  coding: 데스크탑-claude
+  default: round-robin
+  research: local
+  summary: 맥북-gemini
+workers:
+- host: 100.94.234.1
+  model: claude
+  name: 데스크탑-claude
+  role: coding
+  user: daon
+- host: 100.115.54.89
+  model: claude
+  name: 맥북-claude
+  role: summary
+  user: daon
