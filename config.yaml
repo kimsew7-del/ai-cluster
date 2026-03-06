@@ -4,16 +4,16 @@ integrations:
 orchestrator:
   max_retries: 2
   results_dir: ~/.claude-cluster/results
-  timeout: 300
+  timeout: 600
 project:
   local_path: /home/sw/Github/Auto-Tracking-Drone
   name: Auto-Tracking-Drone
-  repo_url: ''
+  repo_url: https://github.com/kimsew7-del/Auto-Tracking-Drone
 roles:
-  coding: 데스크탑-claude
+  coding: round-robin
   default: round-robin
   research: local
-  summary: 맥북-gemini
+  summary: 맥북-claude
 workers:
 - host: 100.94.234.1
   model: claude

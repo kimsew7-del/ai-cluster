@@ -258,6 +258,8 @@ class TaskRunThread(QThread):
         # Parallel execution
         self.status_update.emit(f"병렬 실행 중... ({len(subtasks)}개 서브태스크)")
         start = datetime.now()
+        self._rr_index = 0
+        self._used_workers = set()
         assignments = []
 
         roles_map = config.get("roles", {})
@@ -409,11 +411,30 @@ class TaskRunThread(QThread):
 {combined}"""
         return await self._run_local(prompt, "_system")
 
+    _rr_index = 0
+    _used_workers = set()
+
     def _assign_worker(self, role: str, workers: list, roles_map: dict):
+        if not workers:
+            return None
         target = roles_map.get(role, roles_map.get("default", "round-robin"))
         if target == "local":
             return None
-        for w in workers:
-            if w["name"] == target or w["role"] == role:
-                return w
-        return workers[0] if workers else None
+
+        # Named worker
+        if target not in ("round-robin",):
+            for w in workers:
+                if w["name"] == target:
+                    return w
+
+        # Round-robin: prefer unused workers first
+        available = [w for w in workers if w["name"] not in self._used_workers]
+        if not available:
+            # All used, reset and pick by index
+            self._used_workers.clear()
+            available = workers
+
+        picked = available[self._rr_index % len(available)]
+        self._rr_index += 1
+        self._used_workers.add(picked["name"])
+        return picked
