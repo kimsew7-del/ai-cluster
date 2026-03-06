@@ -11,6 +11,7 @@ from PySide6.QtCore import QThread, Signal
 
 CONFIG_PATH = Path.home() / ".claude-cluster" / "config.yaml"
 RESULTS_DIR = Path.home() / ".claude-cluster" / "results"
+REPO_DIR = Path.home() / ".claude-cluster"
 
 
 def load_config() -> dict:
@@ -202,6 +203,7 @@ class TaskRunThread(QThread):
         proc = await asyncio.create_subprocess_exec(
             "claude", "--print", "-p", prompt,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            cwd=str(REPO_DIR),
         )
         stdout, _ = await proc.communicate()
         return stdout.decode().strip()
