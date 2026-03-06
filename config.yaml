@@ -5,6 +5,10 @@ orchestrator:
   max_retries: 2
   results_dir: ~/.claude-cluster/results
   timeout: 300
+project:
+  local_path: /home/sw/Github/Auto-Tracking-Drone
+  name: Auto-Tracking-Drone
+  repo_url: ''
 roles:
   coding: 데스크탑-claude
   default: round-robin

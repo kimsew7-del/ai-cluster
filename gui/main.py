@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QStatusBar, QMenuBar,
+    QHBoxLayout, QLabel, QPushButton, QWidget, QFileDialog,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QFont
@@ -14,6 +15,7 @@ from task_runner import TaskRunnerTab
 from history import HistoryTab
 from integrations import IntegrationsTab
 from settings import SettingsTab
+from cluster_core import load_config, set_project, detect_git_repo, get_project_dir, ProjectSyncThread
 
 CONFIG_PATH = Path.home() / ".claude-cluster" / "config.yaml"
 RESULTS_DIR = Path.home() / ".claude-cluster" / "results"
@@ -25,8 +27,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AI Cluster Manager")
         self.setMinimumSize(1000, 700)
         self.resize(1200, 800)
+        self._sync_thread = None
 
         self._setup_menubar()
+        self._setup_project_bar()
         self._setup_tabs()
         self._setup_statusbar()
 
@@ -46,6 +50,89 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
+    def _setup_project_bar(self):
+        bar = QWidget()
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(8, 4, 8, 4)
+
+        layout.addWidget(QLabel("프로젝트:"))
+
+        self.project_label = QLabel("선택되지 않음")
+        self.project_label.setStyleSheet("color: #aaa; font-weight: bold; padding: 0 8px;")
+        layout.addWidget(self.project_label)
+
+        self.repo_label = QLabel("")
+        self.repo_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self.repo_label)
+
+        layout.addStretch()
+
+        self.sync_btn = QPushButton("동기화")
+        self.sync_btn.setToolTip("워커들에 프로젝트 동기화 (push + pull)")
+        self.sync_btn.clicked.connect(self._sync_project)
+        self.sync_btn.setEnabled(False)
+        layout.addWidget(self.sync_btn)
+
+        open_btn = QPushButton("폴더 열기")
+        open_btn.clicked.connect(self._open_project)
+        layout.addWidget(open_btn)
+
+        self.setMenuWidget(None)  # clear if any
+        # Insert project bar above tabs
+        central = QWidget()
+        self._central_layout = __import__('PySide6.QtWidgets', fromlist=['QVBoxLayout']).QVBoxLayout(central)
+        self._central_layout.setContentsMargins(0, 0, 0, 0)
+        self._central_layout.setSpacing(0)
+        self._central_layout.addWidget(bar)
+        self.setCentralWidget(central)
+
+        # Load saved project
+        project_dir = get_project_dir()
+        if project_dir and project_dir.exists():
+            self._set_project_display(str(project_dir))
+
+    def _open_project(self):
+        folder = QFileDialog.getExistingDirectory(self, "프로젝트 폴더 선택", str(Path.home()))
+        if not folder:
+            return
+        repo_url = detect_git_repo(Path(folder))
+        set_project(folder, repo_url)
+        self._set_project_display(folder)
+        self.statusBar().showMessage(f"프로젝트 설정: {folder}")
+
+    def _set_project_display(self, path: str):
+        name = Path(path).name
+        self.project_label.setText(name)
+        self.project_label.setStyleSheet("color: #4caf50; font-weight: bold; padding: 0 8px;")
+        repo_url = detect_git_repo(Path(path))
+        if repo_url:
+            self.repo_label.setText(repo_url)
+            self.sync_btn.setEnabled(True)
+        else:
+            self.repo_label.setText("(git repo 없음)")
+            self.sync_btn.setEnabled(False)
+
+    def _sync_project(self):
+        project_dir = get_project_dir()
+        if not project_dir:
+            return
+        config = load_config()
+        workers = config.get("workers", [])
+        self.sync_btn.setEnabled(False)
+        self.sync_btn.setText("동기화 중...")
+        self._sync_thread = ProjectSyncThread(str(project_dir), workers)
+        self._sync_thread.status.connect(lambda msg: self.statusBar().showMessage(msg))
+        self._sync_thread.finished_ok.connect(self._on_sync_done)
+        self._sync_thread.start()
+
+    def _on_sync_done(self, repo_url: str):
+        self.sync_btn.setEnabled(True)
+        self.sync_btn.setText("동기화")
+        if repo_url:
+            self.statusBar().showMessage("워커 동기화 완료")
+        else:
+            self.statusBar().showMessage("동기화 실패 - git remote를 확인하세요")
+
     def _setup_tabs(self):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -63,7 +150,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.settings_tab, "설정")
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
-        self.setCentralWidget(self.tabs)
+        self._central_layout.addWidget(self.tabs)
 
     def _setup_statusbar(self):
         self.statusBar().showMessage("준비 완료")

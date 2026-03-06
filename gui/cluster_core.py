@@ -11,14 +11,51 @@ from PySide6.QtCore import QThread, Signal
 
 CONFIG_PATH = Path.home() / ".claude-cluster" / "config.yaml"
 RESULTS_DIR = Path.home() / ".claude-cluster" / "results"
-REPO_DIR = Path.home() / ".claude-cluster"
 
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        return {"workers": [], "roles": {}, "orchestrator": {"timeout": 300, "max_retries": 2, "results_dir": str(RESULTS_DIR)}}
+        return {"workers": [], "roles": {}, "orchestrator": {"timeout": 300, "max_retries": 2, "results_dir": str(RESULTS_DIR)}, "project": {}}
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f) or {}
+
+
+def get_project_dir() -> Path | None:
+    """Return the current project's local path from config."""
+    config = load_config()
+    path = config.get("project", {}).get("local_path")
+    return Path(path) if path else None
+
+
+def get_project_repo() -> str | None:
+    """Return the current project's GitHub repo URL from config."""
+    config = load_config()
+    return config.get("project", {}).get("repo_url")
+
+
+def detect_git_repo(path: Path) -> str | None:
+    """Detect GitHub remote URL from a local git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def set_project(local_path: str, repo_url: str = None):
+    """Set the current project in config."""
+    config = load_config()
+    config["project"] = {
+        "local_path": local_path,
+        "repo_url": repo_url or "",
+        "name": Path(local_path).name,
+    }
+    save_config(config)
 
 
 def save_config(config: dict):
@@ -79,18 +116,96 @@ class WorkerCheckThread(QThread):
         self.result.emit(worker["name"], online)
 
 
+class ProjectSyncThread(QThread):
+    """Push local project to GitHub and clone/pull on all workers."""
+    status = Signal(str)  # status message
+    finished_ok = Signal(str)  # repo_url
+
+    def __init__(self, project_path: str, workers: list):
+        super().__init__()
+        self.project_path = project_path
+        self.workers = workers
+
+    def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._sync())
+        loop.close()
+
+    async def _sync(self):
+        project = Path(self.project_path)
+        name = project.name
+
+        # Detect or get repo URL
+        repo_url = detect_git_repo(project)
+        if not repo_url:
+            self.status.emit(f"'{name}'에 git remote가 없습니다.")
+            self.finished_ok.emit("")
+            return
+
+        # Push latest
+        self.status.emit("로컬 변경사항 push 중...")
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(project), "push",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        # Clone or pull on each worker
+        for w in self.workers:
+            worker_label = f'{w["user"]}@{w["host"]}'
+            self.status.emit(f"{w['name']}에 동기화 중...")
+            # Check if already cloned
+            check = await asyncio.create_subprocess_exec(
+                "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                worker_label, f'test -d ~/{name}/.git && echo exists',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await check.communicate()
+            if stdout.decode().strip() == "exists":
+                # Pull
+                pull = await asyncio.create_subprocess_exec(
+                    "ssh", "-o", "ConnectTimeout=5", worker_label,
+                    f'cd ~/{name} && GIT_TERMINAL_PROMPT=0 git pull -q',
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                await pull.communicate()
+            else:
+                # Clone
+                clone = await asyncio.create_subprocess_exec(
+                    "ssh", "-o", "ConnectTimeout=10", worker_label,
+                    f'GIT_TERMINAL_PROMPT=0 git clone {repo_url} ~/{name}',
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                await clone.communicate()
+
+        self.status.emit("동기화 완료")
+        self.finished_ok.emit(repo_url)
+
+
+def get_avg_elapsed() -> int | None:
+    """Return average elapsed seconds from past results."""
+    results = load_results()
+    times = [r["elapsed_sec"] for r in results if "elapsed_sec" in r and r["elapsed_sec"] > 0]
+    if not times:
+        return None
+    return sum(times) // len(times)
+
+
 class TaskRunThread(QThread):
     """Run a task through the orchestrator in background."""
     status_update = Signal(str)  # status message
     subtasks_ready = Signal(list)  # subtask list
     worker_started = Signal(str, str)  # worker_name, task_snippet
+    worker_output = Signal(str, str)  # worker_name, partial_text (streaming)
     worker_result = Signal(dict)  # individual worker result
     task_complete = Signal(str, str)  # merged result, result file path
 
-    def __init__(self, task: str, model: str = None):
+    def __init__(self, task: str, model: str = None, project_dir: str = None):
         super().__init__()
         self.task = task
         self.model = model
+        self.project_dir = project_dir
 
     def run(self):
         loop = asyncio.new_event_loop()
@@ -157,7 +272,7 @@ class TaskRunThread(QThread):
             self.worker_started.emit(name, snippet)
             try:
                 if worker is None:
-                    raw = await self._run_local(st["task"])
+                    raw = await self._run_local(st["task"], name)
                 else:
                     raw = await self._run_remote(worker, st["task"], timeout)
                 if isinstance(raw, str):
@@ -199,27 +314,49 @@ class TaskRunThread(QThread):
 
         self.task_complete.emit(merged, str(fname))
 
-    async def _run_local(self, prompt: str) -> str:
+    async def _stream_proc(self, proc, worker_name: str) -> str:
+        """Read stdout line by line and emit partial output."""
+        output = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode()
+            output.append(text)
+            self.worker_output.emit(worker_name, text)
+        return "".join(output).strip()
+
+    async def _run_local(self, prompt: str, worker_name: str = "local(claude)") -> str:
+        cwd = self.project_dir or str(Path.home())
         proc = await asyncio.create_subprocess_exec(
             "claude", "--print", "-p", prompt,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            cwd=str(REPO_DIR),
+            cwd=cwd,
         )
-        stdout, _ = await proc.communicate()
-        return stdout.decode().strip()
+        return await self._stream_proc(proc, worker_name)
 
     async def _run_remote(self, worker: dict, task: str, timeout: int) -> dict:
+        project_name = Path(self.project_dir).name if self.project_dir else ""
+        remote_cmd = f'~/ai {json.dumps(task)}'
+        if project_name:
+            remote_cmd = f'~/ai {json.dumps(task)} {json.dumps(project_name)}'
         cmd = [
             "ssh", "-o", "ConnectTimeout=10",
             f'{worker["user"]}@{worker["host"]}',
-            f'~/ai {json.dumps(task)}',
+            remote_cmd,
         ]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            output = stdout.decode().strip()
+            try:
+                output = await asyncio.wait_for(
+                    self._stream_proc(proc, worker["name"]), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                return {"worker": worker["name"], "model": worker.get("model"), "status": "timeout", "result": "타임아웃"}
+            stderr = await proc.stderr.read()
             if not output:
                 raise RuntimeError(stderr.decode().strip() or "빈 응답")
             return {"worker": worker["name"], "model": worker.get("model"), "status": "ok", "result": output}
@@ -248,7 +385,7 @@ class TaskRunThread(QThread):
 [{{"role": "coding", "task": "서브태스크 내용"}}]
 
 분배할 태스크: {task}"""
-        raw = await self._run_local(prompt)
+        raw = await self._run_local(prompt, "_system")
         try:
             start = raw.find("[")
             end = raw.rfind("]") + 1
@@ -270,7 +407,7 @@ class TaskRunThread(QThread):
 다음은 여러 AI 에이전트의 결과물입니다. 하나의 완성된 답변으로 통합 정리해줘:
 
 {combined}"""
-        return await self._run_local(prompt)
+        return await self._run_local(prompt, "_system")
 
     def _assign_worker(self, role: str, workers: list, roles_map: dict):
         target = roles_map.get(role, roles_map.get("default", "round-robin"))
